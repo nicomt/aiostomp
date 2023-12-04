@@ -9,7 +9,7 @@ from ssl import SSLContext
 from collections import deque, OrderedDict
 
 from aiostomp.protocol import StompProtocol as sp, Frame
-from aiostomp.errors import StompError, StompDisconnectedError, ExceededRetryCount
+from aiostomp.errors import StompError, StompDisconnectedError, ExceededRetryCount, ReceiptTimeout
 from aiostomp.subscription import Subscription
 from aiostomp.heartbeat import StompHeartbeater
 
@@ -334,6 +334,7 @@ class StompReader(asyncio.Protocol):
             "MESSAGE": self._handle_message,
             "CONNECTED": self._handle_connect,
             "ERROR": self._handle_error,
+            "RECEIPT": self._handle_receipt,
         }
 
         self.heartbeat = heartbeat or {}
@@ -350,6 +351,7 @@ class StompReader(asyncio.Protocol):
         self._transport: Optional[asyncio.Transport] = None
         self._protocol = sp()
         self._connect_headers: OrderedDict[str, str] = OrderedDict()
+        self.receipts: Dict[str, asyncio.Event] = {}
 
         self._connect_headers["accept-version"] = "1.1"
 
@@ -488,6 +490,14 @@ class StompReader(asyncio.Protocol):
         if self._frame_handler._on_error:
             await self._frame_handler._on_error(StompError(message, frame.body))
 
+    async def _handle_receipt(self, frame: Frame) -> None:
+        receipt_id = frame.headers.get("receipt-id")
+        if receipt_id in self.receipts:
+            ev = self.receipts.pop(receipt_id)
+            ev.set()
+        else:
+            logger.warning("Receipt %s not found", receipt_id)
+
     async def _handle_exception(self, frame: Frame) -> None:
         logger.warning("Unhandled frame: %s", frame.command)
 
@@ -536,6 +546,7 @@ class StompProtocol:
         self._heartbeat = heartbeat or {}
         self._handler = handler
         self._protocol: Optional[StompReader] = None
+        self._message_id_counter = 0
 
     async def connect(
         self, username: Optional[str] = None, password: Optional[str] = None
@@ -580,10 +591,24 @@ class StompProtocol:
             headers = {"id": subscription.id, "destination": subscription.destination}
             self._protocol.send_frame("UNSUBSCRIBE", headers)
 
-    def send(self, headers: Dict[str, Any], body: Union[bytes, str]) -> None:
+    async def send(self, headers: Dict[str, Any], body: Union[bytes, str], receipt=False) -> None:
         if self._protocol is None:
             raise RuntimeError("Not connected")
+        if receipt:
+            message_id = f"m{self._message_id_counter}"
+            self._message_id_counter += 1
+            headers["receipt"] = message_id
         self._protocol.send_frame("SEND", headers, body)
+
+        if receipt:
+            self._protocol.receipts[message_id] = asyncio.Event()
+            timeout = self._protocol.heartbeater.interval_cy * 2
+            try:
+                await asyncio.wait_for(self._protocol.receipts[message_id].wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Receipt timeout for message %s", message_id)
+                self._protocol.receipts.pop(message_id)
+                raise ReceiptTimeout()
 
     def ack(self, frame: Frame) -> None:
         if self._protocol:

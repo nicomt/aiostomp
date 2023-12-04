@@ -932,7 +932,7 @@ class TestStompProtocol(AsyncTestCase):
     async def test_can_send(self):
 
         await self.protocol.connect()
-        self.protocol.send({"content-length": 2}, "{}")
+        await self.protocol.send({"content-length": 2}, "{}")
 
         self._protocol.send_frame.assert_called_with(
             "SEND", {"content-length": 2}, "{}"
