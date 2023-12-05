@@ -269,12 +269,13 @@ class AioStomp:
             return value.encode("utf-8")
         return value
 
-    def send(
+    async def send(
         self,
         destination: str,
         body: Union[str, bytes] = "",
         headers: Optional[Dict[str, Any]] = None,
         send_content_length=True,
+        receipt=False,
     ) -> None:
         headers = headers or {}
         headers["destination"] = destination
@@ -286,7 +287,7 @@ class AioStomp:
         if send_content_length:
             headers["content-length"] = len(body_b)
 
-        self._protocol.send(headers, body_b)
+        await self._protocol.send(headers, body_b, receipt)
 
     def _subscription_auto_ack(self, frame: Frame) -> bool:
         key = frame.headers.get("subscription", "")
