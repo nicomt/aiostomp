@@ -9,7 +9,7 @@ from ssl import SSLContext
 from collections import deque, OrderedDict
 
 from aiostomp.protocol import StompProtocol as sp, Frame
-from aiostomp.errors import StompError, StompDisconnectedError, ExceededRetryCount, ReceiptTimeout
+from aiostomp.errors import StompError, StompDisconnectedError, ExceededRetryCount, ReceiptTimeout, ConnectionTimeout
 from aiostomp.subscription import Subscription
 from aiostomp.heartbeat import StompHeartbeater
 
@@ -193,7 +193,7 @@ class AioStomp:
                 self._resubscribe_queues()
                 return
 
-            except OSError:
+            except (OSError, ConnectionTimeout):
                 logger.info("Connecting to stomp server failed.")
 
                 if self._should_retry():
@@ -355,6 +355,7 @@ class StompReader(asyncio.Protocol):
         self.receipts: Dict[str, asyncio.Event] = {}
 
         self._connect_headers["accept-version"] = "1.1"
+        self._on_connect = asyncio.Event()
 
         if client_id is not None:
             unique_id = uuid.uuid4()
@@ -447,6 +448,8 @@ class StompReader(asyncio.Protocol):
 
         heartbeat = frame.headers.get("heart-beat")
         logger.debug("Expecting heartbeats: %s", heartbeat)
+        self._on_connect.set()
+
         if heartbeat and self.heartbeat.get("enabled"):
             sx, sy = (int(x) for x in heartbeat.split(","))
 
@@ -570,6 +573,13 @@ class StompProtocol:
         self._transport = trans
         self._protocol = cast(StompReader, proto)
 
+        try:
+            await asyncio.wait_for(self._protocol._on_connect.wait(), timeout=(self._heartbeat.get("cy", 1000) / 500))
+
+        except asyncio.TimeoutError:
+            self._protocol.close()
+            raise ConnectionTimeout("CONNECTED message timed out")
+
     def close(self) -> None:
         if self._protocol:
             self._protocol.close()
@@ -593,8 +603,8 @@ class StompProtocol:
             self._protocol.send_frame("UNSUBSCRIBE", headers)
 
     async def send(self, headers: Dict[str, Any], body: Union[bytes, str], receipt=False) -> None:
-        if self._protocol is None:
-            raise RuntimeError("Not connected")
+        if self._protocol is None or self._protocol.heartbeater is None or not self._protocol.heartbeater.connected:
+            raise StompDisconnectedError("Not connected")
         if receipt:
             message_id = f"m{self._message_id_counter}"
             self._message_id_counter += 1
@@ -609,7 +619,7 @@ class StompProtocol:
             except asyncio.TimeoutError:
                 logger.warning("Receipt timeout for message %s", message_id)
                 self._protocol.receipts.pop(message_id)
-                raise ReceiptTimeout()
+                raise ReceiptTimeout(message_id)
 
     def ack(self, frame: Frame) -> None:
         if self._protocol:

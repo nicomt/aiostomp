@@ -20,3 +20,7 @@ class ExceededRetryCount(StompError):
 class ReceiptTimeout(StompError):
     def __init__(self, message_id: str):
         super().__init__(f"Receipt timeout for message: {message_id}")
+
+
+class ConnectionTimeout(StompError):
+    pass
